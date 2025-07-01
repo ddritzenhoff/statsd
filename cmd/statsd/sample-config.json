@@ -1,7 +1,0 @@
-{
-	"listen-addr": "localhost:8080",
-	"dsn": "~/programming/databases/stats.db",
-	"signing-secret": "",
-	"bot-signing-key": "",
-	"channel-id": ""
-}

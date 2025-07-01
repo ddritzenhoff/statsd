@@ -3,22 +3,22 @@ package main
 import (
 	"context"
 	_ "embed"
-	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
-	"os/user"
-	"path/filepath"
-	"strings"
 
-	"github.com/ddritzenhoff/stats/http"
-	"github.com/ddritzenhoff/stats/sqlite"
-	"github.com/ddritzenhoff/stats/sqlite/gen"
+	"github.com/ddritzenhoff/statsd/http"
+	"github.com/ddritzenhoff/statsd/sqlite"
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/peterbourgon/ff/v3"
 )
 
+const (
+	DSN      string = "/data/statsd.db"
+	HTTPAddr string = "0.0.0.0:8080"
+)
+
+// main is the entry point to the application binary.
 func main() {
 	// Setup signal handlers.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -26,87 +26,68 @@ func main() {
 	signal.Notify(c, os.Interrupt)
 	go func() { <-c; cancel() }()
 
+	m := &Main{}
+
 	// Execute program.
-	if err := Run(ctx); err != nil {
+	if err := m.Run(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 
 	// Wait for CTRL-C.
 	<-ctx.Done()
+
+	// clean up program
+	m.Close()
+}
+
+// Main represents the program.
+type Main struct {
+	// SQLite database used by SQLite service implementations.
+	DB *sqlite.DB
+
+	// HTTP server for handling HTTP communication.
+	// SQLite services are attached to it before running.
+	HTTPServer *http.Server
 }
 
 // Run initializes the member and Slack services and starts the HTTP server.
-func Run(ctx context.Context) error {
-	// setup flags
-	fs := flag.NewFlagSet("statsd", flag.ContinueOnError)
-	var (
-		listenAddr         = fs.String("listen-addr", "localhost:8080", "listen address")
-		dsn                = fs.String("dsn", "~/programming/databases/stats.db", "database connection string")
-		slackSigningSecret = fs.String("signing-secret", "", "to verify Slack requests")
-		slackBotSigningKey = fs.String("bot-signing-key", "", "to send messages into the Slack workspace")
-		slackChannelID     = fs.String("channel-id", "", "to send messages into a specific channel")
-		_                  = fs.String("config", "", "config file (extension: .json)")
-	)
+func (m *Main) Run(ctx context.Context) error {
+	signingSecret := os.Getenv("SLACK_SIGNING_SECRET")
+	botSigningKey := os.Getenv("SLACK_BOT_SIGNING_KEY")
 
-	err := ff.Parse(fs, os.Args[1:],
-		ff.WithConfigFileFlag("config"),
-		ff.WithConfigFileParser(ff.JSONParser),
-	)
-	if err != nil {
-		return fmt.Errorf("Run ff.Parse: %w", err)
-	}
-	DSNPath, err := expandDSN(*dsn)
-	if err != nil {
-		return fmt.Errorf("Run expandDSN: %w", err)
-	}
-	db, err := sqlite.Open(DSNPath)
-	if err != nil {
-		return fmt.Errorf("Run sqlite.Open: %w", err)
+	m.DB = sqlite.NewDB(DSN)
+	if err := m.DB.Open(); err != nil {
+		return fmt.Errorf("db open: %w", err)
 	}
 
-	queries := gen.New(db)
-
-	memberService := sqlite.NewMemberService(queries, db)
-
-	slackService, err := http.NewSlackService(memberService, *slackSigningSecret, *slackBotSigningKey, *slackChannelID)
+	memberService := sqlite.NewMemberService(m.DB)
+	leaderboardService := sqlite.NewLeaderboardService(m.DB)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	slackService, err := http.NewSlackService(logger, memberService, leaderboardService, signingSecret, botSigningKey)
 	if err != nil {
 		return fmt.Errorf("Run NewSlackService: %w", err)
 	}
-	logger := log.New(os.Stdout, "statsd ", log.LstdFlags)
-	httpServer := http.NewServer(logger, *listenAddr, slackService)
-	if err := httpServer.Open(); err != nil {
+
+	m.HTTPServer = http.NewServer(logger, HTTPAddr, slackService)
+	if err := m.HTTPServer.Open(); err != nil {
 		return fmt.Errorf("Run: %w", err)
 	}
+
 	return nil
 }
 
-// expand returns path using tilde expansion. This means that a file path that
-// begins with the "~" will be expanded to prefix the user's home directory.
-func expand(path string) (string, error) {
-	// Ignore if path has no leading tilde.
-	if path != "~" && !strings.HasPrefix(path, "~"+string(os.PathSeparator)) {
-		return path, nil
+// Close gracefully closes open http server and database connections.
+func (m *Main) Close() error {
+	if m.HTTPServer != nil {
+		if err := m.HTTPServer.Close(); err != nil {
+			return err
+		}
 	}
-
-	// Fetch the current user to determine the home path.
-	u, err := user.Current()
-	if err != nil {
-		return path, fmt.Errorf("expand user.Current: %w", err)
-	} else if u.HomeDir == "" {
-		return path, fmt.Errorf("expand u.HomeDir: home directory unset")
+	if m.DB != nil {
+		if err := m.DB.Close(); err != nil {
+			return err
+		}
 	}
-
-	if path == "~" {
-		return u.HomeDir, nil
-	}
-	return filepath.Join(u.HomeDir, strings.TrimPrefix(path, "~"+string(os.PathSeparator))), nil
-}
-
-// expandDSN expands a datasource name. Ignores in-memory databases.
-func expandDSN(dsn string) (string, error) {
-	if dsn == ":memory:" {
-		return dsn, nil
-	}
-	return expand(dsn)
+	return nil
 }

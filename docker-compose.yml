@@ -1,0 +1,16 @@
+version: '3'
+services:
+  statsd:
+    environment:
+      - SLACK_SIGNING_SECRET=${SLACK_SIGNING_SECRET:?slack signing secret not set}
+      - SLACK_BOT_SIGNING_KEY=${SLACK_BOT_SIGNING_KEY:?slack bot signing key not set}
+    image: ddritzenhoff/statsd:latest
+    container_name: statsd
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    command: statsd
+    volumes:
+      - statsd-db:/data/
+volumes:
+  statsd-db:

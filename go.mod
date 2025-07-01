@@ -1,15 +1,14 @@
-module github.com/ddritzenhoff/stats
+module github.com/ddritzenhoff/statsd
 
-go 1.19
+go 1.21
 
 require (
-	github.com/go-chi/chi/v5 v5.0.8
-	github.com/mattn/go-sqlite3 v1.14.16
-	github.com/peterbourgon/ff/v3 v3.3.0
-	github.com/slack-go/slack v0.12.1
+	github.com/go-chi/chi/v5 v5.0.10
+	github.com/mattn/go-sqlite3 v1.14.17
+	github.com/slack-go/slack v0.12.3
 )
 
 require (
-	github.com/gorilla/websocket v1.4.2 // indirect
-	github.com/stretchr/testify v1.8.1 // indirect
+	github.com/gorilla/websocket v1.5.0 // indirect
+	github.com/stretchr/testify v1.8.4 // indirect
 )

@@ -5,17 +5,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"time"
 
-	"github.com/ddritzenhoff/stats"
+	"github.com/ddritzenhoff/statsd"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 )
 
 const (
-	ThumbsUp   = "thumbsup"
-	ThumbsDown = "thumbsdown"
+	ThumbsUp   = "+1"
+	ThumbsDown = "-1"
 )
 
 // Slacker represents a service for handling Slack push events.
@@ -27,81 +28,86 @@ type Slacker interface {
 // Slack represents a service for handling specific Slack events.
 type Slack struct {
 	// Services used by Slack
-	MemberService stats.MemberService
-	client        *slack.Client
+	LeaderboardService statsd.LeaderboardService
+	MemberService      statsd.MemberService
+	client             *slack.Client
 
 	// Dependencies
-	SigningSecret string
-	ChannelID     string
+	logger        *slog.Logger
+	signingSecret string
 }
 
 // NewSlackService creates a new instance of slackService.
-func NewSlackService(ms stats.MemberService, signingSecret string, botSigningKey string, channelID string) (Slacker, error) {
+func NewSlackService(logger *slog.Logger, ms statsd.MemberService, ls statsd.LeaderboardService, signingSecret string, botSigningKey string) (Slacker, error) {
 	return &Slack{
-		MemberService: ms,
-		client:        slack.New(botSigningKey),
-		SigningSecret: signingSecret,
-		ChannelID:     channelID,
+		logger:             logger,
+		MemberService:      ms,
+		LeaderboardService: ls,
+		client:             slack.New(botSigningKey),
+		signingSecret:      signingSecret,
 	}, nil
 }
 
+// HandleMonthlyUpdate sends a summary of the recorded metrics into Slack.
+//
+// Expecting x-www-form-urlencoded payload in the form of `channel=<channelID>&date=<month>-<year>`.
+// I.e. to represent October 2023, the key=value combination would be `date=10-2023`.
 func (s *Slack) HandleMonthlyUpdate(w http.ResponseWriter, r *http.Request) error {
-	summary, err := s.MemberService.Summary()
+	err := r.ParseForm()
 	if err != nil {
-		return fmt.Errorf("HandleMonthlyUpdate: %w", err)
+		return err
 	}
 
-	var sectionBlocks []slack.Block
-	headerText := slack.NewTextBlockObject("mrkdwn", "*Monthly Stats Update*", false, false)
-	headerSection := slack.NewHeaderBlock(headerText)
-	sectionBlocks = append(sectionBlocks, headerSection)
-
-	mostLikesGivenMembers := "Most likes given this month: "
-	for _, member := range summary.MostLikesGiven {
-		mostLikesGivenMembers += fmt.Sprintf("<@%s> (%d)", member.SlackUID, member.GivenLikes)
+	channelID := r.PostForm.Get("channel")
+	if channelID == "" {
+		return errors.New("no channel value provided within the form")
 	}
-	sectionText := slack.NewTextBlockObject("mrkdwn", mostLikesGivenMembers, false, false)
-	sectionBlocks = append(sectionBlocks, slack.NewSectionBlock(sectionText, nil, nil))
-
-	mostLikesReceivedMembers := "Most likes received this month (aka good boy of the month): "
-	for _, member := range summary.MostLikesReceived {
-		mostLikesReceivedMembers += fmt.Sprintf("<@%s> (%d)", member.SlackUID, member.ReceivedLikes)
+	rawDate := r.PostForm.Get("date")
+	if rawDate == "" {
+		return errors.New("no date value provided within the form")
 	}
-	sectionText = slack.NewTextBlockObject("mrkdwn", mostLikesReceivedMembers, false, false)
-	sectionBlocks = append(sectionBlocks, slack.NewSectionBlock(sectionText, nil, nil))
-
-	mostDislikesGivenMembers := "Most dislikes given this month (aka most negative): "
-	for _, member := range summary.MostDislikesGiven {
-		mostDislikesGivenMembers += fmt.Sprintf("<@%s> (%d)", member.SlackUID, member.GivenDislikes)
+	date, err := statsd.NewMonthYearString(rawDate)
+	if err != nil {
+		return err
 	}
-	sectionText = slack.NewTextBlockObject("mrkdwn", mostDislikesGivenMembers, false, false)
-	sectionBlocks = append(sectionBlocks, slack.NewSectionBlock(sectionText, nil, nil))
 
-	mostDislikesReceivedMembers := "Most dislikes received this month (aka the bad bad no good boys): "
-	for _, member := range summary.MostDislikesReceived {
-		mostDislikesReceivedMembers += fmt.Sprintf("<@%s> (%d)", member.SlackUID, member.ReceivedDislikes)
+	leaderboard, err := s.LeaderboardService.FindLeaderboard(date)
+	if err != nil {
+		return err
 	}
-	sectionText = slack.NewTextBlockObject("mrkdwn", mostDislikesReceivedMembers, false, false)
-	sectionBlocks = append(sectionBlocks, slack.NewSectionBlock(sectionText, nil, nil))
 
-	mostReactionsGiven := "Most reactions given this month (aka chill BRUH): "
-	for _, member := range summary.MostReactionsGiven {
-		mostReactionsGiven += fmt.Sprintf("<@%s> (%d)", member.SlackUID, member.GivenReactions)
+	month, err := date.Month()
+	if err != nil {
+		return err
 	}
-	sectionText = slack.NewTextBlockObject("mrkdwn", mostReactionsGiven, false, false)
-	sectionBlocks = append(sectionBlocks, slack.NewSectionBlock(sectionText, nil, nil))
 
-	mostReactionsReceived := "Most reactions received this month (aka Mr.Worldwide): "
-	for _, member := range summary.MostReactionsReceived {
-		mostReactionsReceived += fmt.Sprintf("<@%s> (%d)", member.SlackUID, member.ReceivedReactions)
+	blocks := []slack.Block{
+		slack.NewSectionBlock(
+			slack.NewTextBlockObject("mrkdwn", fmt.Sprintf("Slack member activity for the month of %s", month), false, false),
+			nil,
+			nil,
+		),
+		slack.NewDividerBlock(),
+		slack.NewSectionBlock(
+			slack.NewTextBlockObject("mrkdwn", fmt.Sprintf("- most likes received: <@%s> with %d likes", leaderboard.MostReceivedLikesMember.SlackUID, leaderboard.MostReceivedLikesMember.ReceivedLikes), false, false),
+			nil,
+			nil,
+		),
+		slack.NewSectionBlock(
+			slack.NewTextBlockObject("mrkdwn", fmt.Sprintf("- hottest takes (most dislikes received): <@%s> with %d dislikes", leaderboard.MostReceivedDislikesMember.SlackUID, leaderboard.MostReceivedDislikesMember.ReceivedDislikes), false, false),
+			nil,
+			nil,
+		),
 	}
-	sectionText = slack.NewTextBlockObject("mrkdwn", mostReactionsReceived, false, false)
-	sectionBlocks = append(sectionBlocks, slack.NewSectionBlock(sectionText, nil, nil))
-	compiledMsg := slack.MsgOptionBlocks(sectionBlocks...)
-	_, _, err = s.client.PostMessage(s.ChannelID, compiledMsg)
+
+	msg := slack.NewBlockMessage(blocks...)
+
+	_, _, err = s.client.PostMessage(channelID, slack.MsgOptionBlocks(msg.Blocks.BlockSet...))
 	if err != nil {
 		return fmt.Errorf("WeeklyUpdate PostMessage: %w", err)
 	}
+
+	s.logger.Info("published monthly update", slog.String("month", month))
 	return nil
 }
 
@@ -112,7 +118,7 @@ func (s *Slack) HandleEvents(w http.ResponseWriter, r *http.Request) error {
 		w.WriteHeader(http.StatusBadRequest)
 		return fmt.Errorf("HandleEvents: %w", err)
 	}
-	sv, err := slack.NewSecretsVerifier(r.Header, s.SigningSecret)
+	sv, err := slack.NewSecretsVerifier(r.Header, s.signingSecret)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		return fmt.Errorf("HandleEvents: %w", err)
@@ -147,13 +153,11 @@ func (s *Slack) HandleEvents(w http.ResponseWriter, r *http.Request) error {
 		case *slackevents.ReactionAddedEvent:
 			err := s.HandleReactionAddedEvent(ev)
 			if err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
 				return fmt.Errorf("HandleEvents: %w", err)
 			}
 		case *slackevents.ReactionRemovedEvent:
 			err := s.HandleReactionRemovedEvent(ev)
 			if err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
 				return fmt.Errorf("HandleEvents: %w", err)
 			}
 		}
@@ -161,158 +165,71 @@ func (s *Slack) HandleEvents(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// HandleReactionAddedEvent handles the event when a user reacts to the post of another user.
-func (s *Slack) HandleReactionAddedEvent(e *slackevents.ReactionAddedEvent) error {
-	year, month, _ := time.Now().Date()
-
-	// If the user is reacting to his own message, do nothing.
-	if e.User == e.ItemUser {
+// HandleReactionEvent handles an event by updating the member with the specified slackUID.
+func (s *Slack) HandleReactionEvent(memSlackUID string, update func(m *statsd.Member)) error {
+	if memSlackUID == "USLACKBOT" || memSlackUID == "" {
+		s.logger.Info("reaction to invalid target", slog.String("target slackUID", memSlackUID))
 		return nil
 	}
+	monthYear := statsd.NewMonthYear(time.Now().UTC())
 
-	// Create the member (user reacting to the material) if he does not already exist within the database.
-	member, err := s.MemberService.FindMember(e.User, month, int64(year))
-	if err != nil {
-		if errors.Is(err, stats.ErrNotFound) {
-			err = s.MemberService.CreateMember(&stats.Member{
-				SlackUID: e.User,
-				Date: stats.Date{
-					Month: month,
-					Year:  int64(year),
-				},
-			})
-			if err != nil {
-				return fmt.Errorf("HandleReactionAddedEvent CreateMember member: %w", err)
-			}
-			s.HandleReactionAddedEvent(e)
+	// Create the member if he does not already exist within the database.
+	mem, err := s.MemberService.FindMember(memSlackUID, monthYear)
+	if errors.Is(err, statsd.ErrNotFound) {
+		m := &statsd.Member{
+			SlackUID: memSlackUID,
+			Date:     monthYear,
 		}
-		return fmt.Errorf("HandleReactionAddedEvent FindMember User: %w", err)
-	}
-
-	// Create the member (user being reacted to) if he does not already exist within the database.
-	itemMember, err := s.MemberService.FindMember(e.ItemUser, month, int64(year))
-	if err != nil {
-		if errors.Is(err, stats.ErrNotFound) {
-			err = s.MemberService.CreateMember(&stats.Member{
-				SlackUID: e.User,
-				Date: stats.Date{
-					Month: month,
-					Year:  int64(year),
-				},
-			})
-			if err != nil {
-				return fmt.Errorf("HandleReactionAddedEvent CreateMember itemMember: %w", err)
-			}
-			s.HandleReactionAddedEvent(e)
+		err := s.MemberService.CreateMember(m)
+		if err != nil {
+			return fmt.Errorf("HandleReactionAddedEvent CreateMember itemMember: %w", err)
 		}
+		s.logger.Info("created new member", slog.String("slackUID", m.SlackUID), slog.String("date", monthYear.String()))
+		mem = m
+	} else if err != nil {
 		return fmt.Errorf("HandleReactionAddedEvent FindMember ItemUser: %w", err)
 	}
 
-	// Update the reactions.
-	member.GivenReactions += 1
-	itemMember.ReceivedReactions += 1
-	if e.Reaction == ThumbsUp {
-		member.GivenLikes += 1
-		itemMember.ReceivedLikes += 1
-	} else if e.Reaction == ThumbsDown {
-		member.GivenDislikes += 1
-		itemMember.ReceivedDislikes += 1
-	}
-
-	// Update the stats of the User reacting to the message.
-	s.MemberService.UpdateMember(member.ID, stats.MemberUpdate{
-		GivenReactions: &member.GivenReactions,
-		GivenLikes:     &member.GivenLikes,
-		GivenDislikes:  &member.GivenDislikes,
-	})
+	update(mem)
 
 	// Update the stats of the User being reacted to.
-	s.MemberService.UpdateMember(itemMember.ID, stats.MemberUpdate{
-		ReceivedReactions: &itemMember.ReceivedReactions,
-		ReceivedLikes:     &itemMember.ReceivedLikes,
-		ReceivedDislikes:  &itemMember.ReceivedDislikes,
+	m, err := s.MemberService.UpdateMember(mem.ID, statsd.MemberUpdate{
+		ReceivedLikes:    &mem.ReceivedLikes,
+		ReceivedDislikes: &mem.ReceivedDislikes,
 	})
+	if err != nil {
+		return err
+	}
+	s.logger.Info("updated user", slog.String("slackUID", m.SlackUID), slog.Int("received likes", m.ReceivedLikes), slog.Int("received dislikes", m.ReceivedDislikes))
 	return nil
 }
 
-// max finds the max between two int64s and returns it.
-func max(a int64, b int64) int64 {
-	if a > b {
-		return a
+// HandleReactionAddedEvent handles the event when a user reacts to the post of another user.
+func (s *Slack) HandleReactionAddedEvent(e *slackevents.ReactionAddedEvent) error {
+	switch e.Reaction {
+	case ThumbsUp:
+		return s.HandleReactionEvent(e.ItemUser, func(m *statsd.Member) {
+			m.ReceivedLikes += 1
+		})
+	case ThumbsDown:
+		return s.HandleReactionEvent(e.ItemUser, func(m *statsd.Member) {
+			m.ReceivedDislikes += 1
+		})
 	}
-	return b
+	return nil
 }
 
 // HandleReactionRemovedEvent handles the event when a user removes a reaction from another user's post.
 func (s *Slack) HandleReactionRemovedEvent(e *slackevents.ReactionRemovedEvent) error {
-	year, month, _ := time.Now().Date()
-
-	// If the user is reacting to his own message, do nothing.
-	if e.User == e.ItemUser {
-		return nil
+	switch e.Reaction {
+	case ThumbsUp:
+		return s.HandleReactionEvent(e.ItemUser, func(m *statsd.Member) {
+			m.ReceivedLikes = max(m.ReceivedLikes-1, 0)
+		})
+	case ThumbsDown:
+		return s.HandleReactionEvent(e.ItemUser, func(m *statsd.Member) {
+			m.ReceivedDislikes = max(m.ReceivedDislikes-1, 0)
+		})
 	}
-
-	// Create the member (user reacting to the material) if he does not already exist within the database.
-	member, err := s.MemberService.FindMember(e.User, month, int64(year))
-	if err != nil {
-		if errors.Is(err, stats.ErrNotFound) {
-			err = s.MemberService.CreateMember(&stats.Member{
-				SlackUID: e.User,
-				Date: stats.Date{
-					Month: month,
-					Year:  int64(year),
-				},
-			})
-			if err != nil {
-				return fmt.Errorf("HandleReactionRemovedEvent CreateMember member: %w", err)
-			}
-			s.HandleReactionRemovedEvent(e)
-		}
-		return fmt.Errorf("HandleReactionRemovedEvent FindMember User: %w", err)
-	}
-
-	// Create the member (user being reacted to) if he does not already exist within the database.
-	itemMember, err := s.MemberService.FindMember(e.ItemUser, month, int64(year))
-	if err != nil {
-		if errors.Is(err, stats.ErrNotFound) {
-			err = s.MemberService.CreateMember(&stats.Member{
-				SlackUID: e.User,
-				Date: stats.Date{
-					Month: month,
-					Year:  int64(year),
-				},
-			})
-			if err != nil {
-				return fmt.Errorf("HandleReactionRemovedEvent CreateMember itemMember: %w", err)
-			}
-			s.HandleReactionRemovedEvent(e)
-		}
-		return fmt.Errorf("HandleReactionRemovedEvent FindMember ItemUser: %w", err)
-	}
-
-	// Update the reactions.
-	member.GivenReactions = max(member.GivenReactions-1, 0)
-	itemMember.ReceivedReactions = max(itemMember.ReceivedReactions-1, 0)
-	if e.Reaction == ThumbsUp {
-		member.GivenLikes = max(member.GivenLikes-1, 0)
-		itemMember.ReceivedLikes = max(itemMember.ReceivedLikes-1, 0)
-	} else if e.Reaction == ThumbsDown {
-		member.GivenDislikes = max(member.GivenDislikes-1, 0)
-		itemMember.ReceivedDislikes = max(itemMember.ReceivedDislikes-1, 0)
-	}
-
-	// Update the stats of the User reacting to the message.
-	s.MemberService.UpdateMember(member.ID, stats.MemberUpdate{
-		GivenReactions: &member.GivenReactions,
-		GivenLikes:     &member.GivenLikes,
-		GivenDislikes:  &member.GivenDislikes,
-	})
-
-	// Update the stats of the User being reacted to.
-	s.MemberService.UpdateMember(itemMember.ID, stats.MemberUpdate{
-		ReceivedReactions: &itemMember.ReceivedReactions,
-		ReceivedLikes:     &itemMember.ReceivedLikes,
-		ReceivedDislikes:  &itemMember.ReceivedDislikes,
-	})
 	return nil
 }

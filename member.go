@@ -1,64 +1,87 @@
-package stats
+package statsd
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
-// Date represents the month and year in which the slack reactions are grouped.
-type Date struct {
-	Month time.Month `json:"month"`
-	Year  int64      `json:"year"`
+// MonthYear represents a string with the following format: <month>-<year>.
+// I.e. `02-2024` represents February 2024.
+type MonthYear string
+
+const monthYearLayout string = "01-2006"
+
+// NewMonthYear returns a new instance of MonthYear.
+func NewMonthYear(t time.Time) MonthYear {
+	return MonthYear(t.UTC().Format(monthYearLayout))
+}
+
+// NewMonthYearString returns a new instance of MonthYear.
+func NewMonthYearString(s string) (MonthYear, error) {
+	t, err := time.Parse(monthYearLayout, s)
+	if err != nil {
+		return "", err
+	}
+	return NewMonthYear(t), nil
+}
+
+// String returns the string representation of MonthYear.
+func (my *MonthYear) String() string {
+	return string(*my)
+}
+
+// Month returns the English name of the corresponding month.
+func (my *MonthYear) Month() (string, error) {
+	t, err := time.Parse(monthYearLayout, my.String())
+	if err != nil {
+		return "", fmt.Errorf("unable to parse the MonthYear: %s", my.String())
+	}
+	return t.Month().String(), nil
 }
 
 // Member represents reactions pertaining to a particular member of the slack organization within a given month and year.
 type Member struct {
-	ID                int64  `json:"id"`
-	SlackUID          string `json:"slackUID"`
-	ReceivedLikes     int64  `json:"receivedLikes"`
-	ReceivedDislikes  int64  `json:"receivedDislikes"`
-	ReceivedReactions int64  `json:"receivedReactions"`
-	GivenLikes        int64  `json:"givenLikes"`
-	GivenDislikes     int64  `json:"givenDislikes"`
-	GivenReactions    int64  `json:"givenReactions"`
-	Date              Date   `json:"date"`
+	ID               int       `json:"id"`
+	Date             MonthYear `json:"date"`
+	SlackUID         string    `json:"slackUID"`
+	ReceivedLikes    int       `json:"receivedLikes"`
+	ReceivedDislikes int       `json:"receivedDislikes"`
+	CreatedAt        time.Time `json:"createdAt"`
+	UpdatedAt        time.Time `jons:"updatedAt"`
+}
+
+// Validate returns an error if the member contains invalid fields.
+// This only performs basic validation.
+func (m *Member) Validate() error {
+	if m.SlackUID == "" {
+		return fmt.Errorf("slack user ID required %w", ErrInvalid)
+	}
+	return nil
 }
 
 // MemberService represents a service for managing a Member.
 type MemberService interface {
 	// FindMemberByID retrieves a Member by ID.
 	// Returns ErrNotFound if the ID does not exist.
-	FindMemberByID(id int64) (*Member, error)
+	FindMemberByID(id int) (*Member, error)
 
-	// FindMember retrives a Member by his Slack User ID, the Month, and the Year.
-	// Returns ErrNotFound if not matches found.
-	FindMember(SlackUID string, Month time.Month, Year int64) (*Member, error)
+	// FindMember retrives a Member by his Slack User ID, and date (month and year).
+	// Returns ErrNotFound if no matches found.
+	FindMember(SlackUID string, date MonthYear) (*Member, error)
 
 	// CreateMember creates a new Member.
 	CreateMember(m *Member) error
 
 	// UpdateMember updates a Member.
-	UpdateMember(id int64, upd MemberUpdate) error
-
-	// Summary returns a summary of the members.
-	Summary() (*MemberSummary, error)
+	// Returns ErrNotFound if the member does not exist.
+	UpdateMember(id int, upd MemberUpdate) (*Member, error)
 
 	// DeleteMember permanently deletes a Member
-	DeleteMember(id int64) error
-}
-
-type MemberSummary struct {
-	MostLikesGiven        []Member
-	MostDislikesGiven     []Member
-	MostReactionsGiven    []Member
-	MostLikesReceived     []Member
-	MostDislikesReceived  []Member
-	MostReactionsReceived []Member
+	DeleteMember(id int) error
 }
 
 // MemberUpdate represents a set of fields to be updated via UpdateMember().
 type MemberUpdate struct {
-	ReceivedLikes     *int64
-	ReceivedDislikes  *int64
-	ReceivedReactions *int64
-	GivenLikes        *int64
-	GivenDislikes     *int64
-	GivenReactions    *int64
+	ReceivedLikes    *int
+	ReceivedDislikes *int
 }
